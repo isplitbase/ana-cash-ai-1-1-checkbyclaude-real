@@ -37,7 +37,7 @@ def _norm(name: Any) -> str:
     """科目名の表記ゆれをそろえる（全角半角・空白・【】・句読点・「(損失)」・末尾の「金額」）"""
     s = unicodedata.normalize("NFKC", str(name or ""))
     s = re.sub(r"[(（][^)）]*損失[^)）]*[)）]", "", s)
-    s = re.sub(r"[\s【】\[\]()（）、・,]", "", s)
+    s = re.sub(r"[\s【】\[\]()（）、・,*＊]", "", s)
     s = re.sub(r"金額$", "", s)
     return s
 
@@ -157,11 +157,14 @@ def run_checks(resp: dict) -> Dict[str, bool]:
             add(f"【{p}】BS:利益剰余金＝利益準備金＋その他利益剰余金", legal + other_re, retained)
         carried = g(bs, "繰越利益剰余金")
         if None not in (other_re, carried):
-            # その他利益剰余金 ＝ 任意積立金（〜積立金・利益準備金以外の〜準備金）＋ 繰越利益剰余金
-            reserves = [_get(r, p) for r in bs
-                        if re.search(r"(積立金|準備金)$", _norm(r.get("勘定科目")))
-                        and _norm(r.get("勘定科目")) not in ("利益準備金", "資本準備金")]
-            add(f"【{p}】BS:その他利益剰余金＝積立金＋繰越利益剰余金", sum(v or 0 for v in reserves) + carried, other_re)
+            # その他利益剰余金 ＝ 任意積立金（その他利益剰余金と繰越利益剰余金の行の間にある〜積立金・〜準備金）＋ 繰越利益剰余金
+            # 資産の「投資信託積立金」などを拾わないよう、行の位置で絞る
+            r_from, r_to = _find(bs, "その他利益剰余金"), _find(bs, "繰越利益剰余金")
+            i_from, i_to = bs.index(r_from), bs.index(r_to)
+            if i_from < i_to:
+                reserves = [_get(r, p) for r in bs[i_from + 1:i_to]
+                            if re.search(r"(積立金|準備金)$", _norm(r.get("勘定科目")))]
+                add(f"【{p}】BS:その他利益剰余金＝積立金＋繰越利益剰余金", sum(v or 0 for v in reserves) + carried, other_re)
 
         # 3) PL の利益の流れ
         sales, cogs, gross = g(pl, "売上高"), g(pl, "売上原価"), g(pl, "売上総利益")
@@ -179,9 +182,13 @@ def run_checks(resp: dict) -> Dict[str, bool]:
         #     合計 ＝ 期首棚卸 ＋ 仕入（リベート等の控除を含む）＋ 当期製品製造原価
         begin = next((r for r in pl if _norm(r.get("勘定科目")).startswith("期首")), None)
         end = next((r for r in pl if _norm(r.get("勘定科目")).startswith("期末")), None)
-        subtotal = _find(pl, "合計", "売上原価合計")
-        if cogs is not None and end is not None and subtotal is not None and None not in (_get(end, p), _get(subtotal, p)):
-            add(f"【{p}】PL:売上原価＝合計−期末棚卸", _get(subtotal, p) - _get(end, p), cogs)
+        # 合計の行は期ごとに名前が分かれていることがある（「＊＊合計＊＊」「合計」「合計（仕入）」）ので、この期に値がある行を使う
+        subtotal = next((r for r in pl if _norm(r.get("勘定科目")) in ("合計", "合計仕入", "売上原価合計") and _get(r, p) is not None), None)
+        # 建設業などは「兼業売上原価」が 期首＋仕入−期末 になる
+        cogs_flow = g(pl, "売上原価") if g(pl, "売上原価") is not None else g(pl, "兼業売上原価")
+        if cogs_flow is not None and end is not None and subtotal is not None and None not in (_get(end, p), _get(subtotal, p)):
+            # 期末棚卸は △ 付き（マイナス）で書く決算書もあるので、大きさで差し引く
+            add(f"【{p}】PL:売上原価＝合計−期末棚卸", _get(subtotal, p) - abs(_get(end, p)), cogs_flow)
         if begin is not None and end is not None and subtotal is not None and _get(subtotal, p) is not None:
             i0, i1 = pl.index(begin), pl.index(subtotal)
             if i0 < i1:
@@ -228,6 +235,33 @@ def _failing(checks: Dict[str, bool]) -> set:
 # ------------------------------------------------------------
 # PDF の取得
 # ------------------------------------------------------------
+IMAGE_MAX_EDGE = int(os.getenv("CORRECT_IMAGE_MAX_EDGE", "2400"))   # 長い辺の画素数（Claude の画像の上限 5MB に収める）
+
+
+def _download_images(urls: List[str]) -> List[Tuple[str, bytes]]:
+    """ページ画像（https の署名付き URL・gs://）を取得し、JPEG に縮めて返す（z-lite 用。z-lite は PDF を保存しないため）"""
+    import io
+    import httpx
+    from PIL import Image
+    out = []
+    for i, uri in enumerate(urls, start=1):
+        if uri.startswith("gs://"):
+            from google.cloud import storage
+            bucket, key = uri[len("gs://"):].split("/", 1)
+            raw = storage.Client().bucket(bucket).blob(key).download_as_bytes()
+        else:
+            r = httpx.get(uri, timeout=60, follow_redirects=True)
+            r.raise_for_status()
+            raw = r.content
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        if max(img.size) > IMAGE_MAX_EDGE:
+            img.thumbnail((IMAGE_MAX_EDGE, IMAGE_MAX_EDGE))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88)
+        out.append((f"ページ{i}", buf.getvalue()))
+    return out
+
+
 def _download_pdfs(urls: List[str], workdir: Path) -> List[Tuple[str, bytes]]:
     pdfs = []
     for i, uri in enumerate(urls, start=1):
@@ -248,6 +282,7 @@ def _download_pdfs(urls: List[str], workdir: Path) -> List[Tuple[str, bytes]]:
 # ------------------------------------------------------------
 PROMPT = """あなたは決算書の読取結果を直す担当者です。
 添付の決算書PDFと、下の「読取結果」（PDFをOCRで読み取ったもの）を見比べ、読取結果の誤りの直し方を出してください。
+（PDFの代わりにページ画像が添付されているときは、画像を決算書のページとして扱う。画像の前の【ページn】が page_no = n に当たる。）
 
 ## 探すもの
 - 読み違い：PDFと金額が違う（桁・数字の読み違い、△▲のマイナスの付け忘れ・付け過ぎ）
@@ -272,6 +307,8 @@ PDFでは同じ1つの科目なのに、読み違いで期ごとに別の名前�
 - 同じ表（BS・PL・販売費・製造原価）の中の行どうしだけ。from の値は、keep が空欄の期に移す。
 - 両方の行に同じ期の値があり、その値が違う場合はまとめない（別の科目なので）。
 - PDFで同じ科目だと確かめられたものだけ。名前が似ているだけの別の科目はまとめない。
+- 行は分かれていないが、科目名そのものを読み違えている行（例：PDFは「保険掛金」なのに3期とも「保険積立金」）は、
+  from を書かずに keep と name だけを出す（科目名だけ直す）。書き方の違い（「売上総利益金額」と「売上総利益」など）は直さない。
 
 ## 読取結果（id は行の番号）
 ```json
@@ -344,10 +381,16 @@ def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str, ai_case_id=None) -
     if not api_key:
         raise AIUnavailable([{"model": "-", "error": "ANTHROPIC_API_KEY が設定されていません"}])
     client = anthropic.Anthropic(api_key=api_key, max_retries=3, timeout=300)
-    content = [{"type": "document", "title": name,
-                "source": {"type": "base64", "media_type": "application/pdf",
-                           "data": base64.standard_b64encode(b).decode("ascii")}}
-               for name, b in pdfs]
+    content = []
+    for name, b in pdfs:
+        if b[:4] == b"%PDF":
+            content.append({"type": "document", "title": name,
+                            "source": {"type": "base64", "media_type": "application/pdf",
+                                       "data": base64.standard_b64encode(b).decode("ascii")}})
+        else:   # ページ画像（z-lite）。page_no と対応させるため、画像の前にページ番号を書く
+            content.append({"type": "text", "text": f"【{name}】（page_no = {name.replace('ページ', '')}）"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                        "data": base64.standard_b64encode(b).decode("ascii")}})
     content.append({"type": "text", "text": PROMPT.format(read_data=read_data)})
 
     models = []
@@ -420,7 +463,26 @@ def _apply_merges(resp: dict, merges: List[dict], index, fail_cur: set) -> Tuple
     current = resp
     merged, rejected, drop = [], [], set()
     for m in merges or []:
-        if not isinstance(m, dict) or m.get("keep") not in index or m.get("from") not in index or m.get("keep") == m.get("from"):
+        if not isinstance(m, dict) or m.get("keep") not in index:
+            continue
+        if not m.get("from"):
+            # 科目名だけの直し（行は分かれていない）。直しても検算が変わらない（合わなくなる・検算できなくなる項目が無い）ときだけ
+            s1, i1 = index[m["keep"]]
+            name = str(m.get("name") or "").strip()
+            old = current[s1][i1].get("勘定科目", "")
+            if not name or _norm(name) == _norm(old):
+                continue
+            trial = copy.deepcopy(current)
+            trial[s1][i1]["勘定科目"] = name
+            checks_before, checks_trial = run_checks(current), run_checks(trial)
+            if _failing(checks_trial) - fail_cur or set(checks_before) - set(checks_trial):
+                rejected.append({"section": s1, "keep": old, "from": "", "name": name, "reason": m.get("reason", ""),
+                                 "why": "科目名を変えると検算が変わる"})
+                continue
+            current = trial
+            merged.append({"section": s1, "keep": old, "from": "", "name": name, "reason": m.get("reason", "")})
+            continue
+        if m.get("from") not in index or m.get("keep") == m.get("from"):
             continue
         (s1, i1), (s2, i2) = index[m["keep"]], index[m["from"]]
         keep, src = current[s1][i1], current[s2][i2]
@@ -471,14 +533,16 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = payload.get("response") or {}
     if not isinstance(resp, dict) or not any(resp.get(s) for s in SECTIONS):
         return {"status": "error", "message": "response（読取結果）がありません"}
-    pdfurls = payload.get("pdfurls") or []
-    if isinstance(pdfurls, str):
-        pdfurls = [u for u in pdfurls.split("|,|") if u.strip()]
-    if not pdfurls:
-        return {"status": "error", "message": "pdfurls がありません"}
+    split = lambda v: [u.strip() for u in (v.split("|,|") if isinstance(v, str) else (v or [])) if str(u).strip()]
+    pdfurls, image_urls = split(payload.get("pdfurls")), split(payload.get("image_urls"))
+    if not pdfurls and not image_urls:
+        return {"status": "error", "message": "pdfurls も image_urls もありません"}
 
-    with tempfile.TemporaryDirectory(prefix="correct_") as td:
-        pdfs = _download_pdfs(pdfurls, Path(td))
+    if pdfurls:          # ana：PDF をそのまま渡す
+        with tempfile.TemporaryDirectory(prefix="correct_") as td:
+            pdfs = _download_pdfs(pdfurls, Path(td))
+    else:                # z-lite：PDF を保存しないので、読取に使ったページ画像を渡す（画像の順番＝page_no）
+        pdfs = _download_images(image_urls)
     read_data, index = _compact(resp)
     try:
         raw, model, attempts, raw_merges = ask_claude(pdfs, read_data, payload.get("ai_case_id"))
@@ -538,6 +602,25 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
                 # 合計を壊さないので反映する
                 applied += [{**_describe(c, current, index), "note": "行ずれの直し（値の入れ替えのみ）"} for c in items]
                 current, pass_cur, progress = trial, pass_trial, True
+            else:
+                rest.append(items)
+        pending = rest
+    # 1つずつでは裏付けが取れなかった修正を、同じ表・同じ期ごとにまとめてもう一度試す
+    # （例：期首・合計・期末の3つが全部 0 と読まれたときは、3つそろって直さないと検算が合わない）
+    if pending:
+        bundles: Dict[Tuple[str, str], List[dict]] = {}
+        for items in pending:
+            for c in items:
+                bundles.setdefault((index[c["id"]][0], c["period"]), []).append(c)
+        rest = []
+        for items in bundles.values():
+            trial = _apply(current, items, index)
+            checks_trial = run_checks(trial)
+            fail_trial = _failing(checks_trial)
+            pass_trial = {k for k, ok in checks_trial.items() if ok}
+            if len(items) > 1 and (fail_trial < fail_cur or (fail_trial <= fail_cur and pass_trial > pass_cur)):
+                applied += [{**_describe(c, current, index), "note": "同じ表・同じ期の修正をまとめて検算"} for c in items]
+                current, fail_cur, pass_cur = trial, fail_trial, pass_trial
             else:
                 rest.append(items)
         pending = rest
